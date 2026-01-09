@@ -14,9 +14,25 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 FLAG_LANG = {
-    "🇲🇽": "es",
-    "🇺🇸": "en",
-    "🇧🇷": "pt"
+    # Español
+    "🇲🇽": "es",  # México
+    "🇦🇷": "es",  # Argentina
+
+    # Inglés
+    "🇺🇸": "en",  # USA
+    "🇨🇦": "en",  # Canadá (inglés)
+
+    # Portugués
+    "🇧🇷": "pt",  # Brasil
+
+    # Francés
+    "🇫🇷": "fr",  # Francia
+
+    # Alemán
+    "🇩🇪": "de",  # Alemania
+
+    # Ruso
+    "🇷🇺": "ru"   # Rusia
 }
 
 @bot.event
