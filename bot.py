@@ -1,38 +1,46 @@
 import discord
 import os
+from discord.ext import commands
 from deep_translator import GoogleTranslator
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.messages = True
 intents.reactions = True
 intents.guilds = True
 
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 FLAG_LANG = {
-    "🇪🇸": "es",
     "🇲🇽": "es",
     "🇺🇸": "en",
-    "🇬🇧": "en",
     "🇧🇷": "pt"
 }
 
-@client.event
+@bot.event
 async def on_ready():
-    print(f"Conectado como {client.user}")
+    print(f"✅ Conectado como {bot.user}")
 
-@client.event
-async def on_reaction_add(reaction, user):
-    if user.bot:
+@bot.event
+async def on_raw_reaction_add(payload):
+    if payload.user_id == bot.user.id:
         return
 
-    emoji = str(reaction.emoji)
+    emoji = str(payload.emoji)
     if emoji not in FLAG_LANG:
         return
 
-    message = reaction.message
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except:
+        return
+
     if message.author.bot or not message.content:
         return
 
@@ -44,10 +52,10 @@ async def on_reaction_add(reaction, user):
             target=target_lang
         ).translate(message.content)
 
-        if translated and translated.lower() != message.content.lower():
+        if translated.lower() != message.content.lower():
             await message.reply(f"{emoji} **{translated}**")
 
     except Exception as e:
-        print("Error al traducir:", e)
+        print("❌ Error traduciendo:", e)
 
-client.run(TOKEN)
+bot.run(TOKEN)
