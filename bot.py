@@ -53,8 +53,8 @@ FLAG_LANG = {
     "🇬🇶": "es",  # Guinea Ecuatorial
 
     # Inglés
-    "🇺🇸": "en",  # USA
-    "UM": "en",  # USA
+    "🇺🇸": "en", # USA (U+1F1FA U+1F1F8)
+    "🇺🇲": "en", # Islas menores de EE.UU.
     "🇨🇦": "en",  # Canadá
     "🇬🇧": "en",  # Reino Unido
     "🇮🇪": "en",  # Irlanda
