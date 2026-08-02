@@ -31,6 +31,8 @@ FLAG_LANG = {
     "🇦🇷": "es",  # Argentina
     "🇲🇽": "es",  # México
     "🇪🇸": "es",  # España
+    "🇪🇦": "es", # Ceuta y Melilla
+    "🇮🇨": "es", # Islas Canarias
     "🇧🇴": "es",  # Bolivia
     "🇨🇱": "es",  # Chile
     "🇨🇴": "es",  # Colombia
@@ -52,6 +54,7 @@ FLAG_LANG = {
 
     # Inglés
     "🇺🇸": "en",  # USA
+    "UM": "en",  # USA
     "🇨🇦": "en",  # Canadá
     "🇬🇧": "en",  # Reino Unido
     "🇮🇪": "en",  # Irlanda
