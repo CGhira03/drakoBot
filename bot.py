@@ -1,9 +1,13 @@
 import logging
 import os
+import asyncio
+import random
+from collections import OrderedDict
 
 import discord
 from discord.ext import commands
 from deep_translator import GoogleTranslator
+from deep_translator.exceptions import LanguageNotSupportedException
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,14 +19,17 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("❌ Falta la variable de entorno DISCORD_TOKEN")
 
-MAX_REPLY_LENGTH = 1900  # margen por debajo del límite de 2000 de Discord
-MAX_CACHE_SIZE = 5000    # evita que la cache crezca sin límite en procesos de larga duración
+MAX_REPLY_LENGTH = 1900
+MAX_CACHE_SIZE = 5000
+TRANSLATION_DELAY = 0.8
+MAX_RETRIES = 3
+
+_translation_lock = asyncio.Lock()
+_translated_cache = OrderedDict()   # (message_id, lang) -> True
+_in_progress = set()                # (message_id, lang) en curso
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.messages = True
-intents.reactions = True
-intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -376,15 +383,46 @@ FLAG_LANG = {
     "🇱🇸": "st",  # Lesoto
 }
 
-# Evita traducir de nuevo el mismo mensaje al mismo idioma si varias
-# personas reaccionan con la misma bandera. Se resetea en cada reinicio
-# del proceso; el tope evita que crezca sin límite mientras el bot sigue vivo.
-_translated_cache = set()
+SUPPORTED_LANGS = set(GoogleTranslator().get_supported_languages(as_dict=True).values())
+
+
+def remember(key):
+    _translated_cache[key] = True
+    while len(_translated_cache) > MAX_CACHE_SIZE:
+        _translated_cache.popitem(last=False)
+
+
+async def translate_safely(text, target_lang):
+    async with _translation_lock:
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = await asyncio.to_thread(
+                    GoogleTranslator(source="auto", target=target_lang).translate,
+                    text,
+                )
+                await asyncio.sleep(TRANSLATION_DELAY)
+                return result
+
+            except LanguageNotSupportedException:
+                logger.error("Idioma no soportado: %s", target_lang)
+                return None  # no tiene sentido reintentar
+
+            except Exception as e:
+                logger.warning(
+                    "Error de traducción (intento %s/%s): %s",
+                    attempt + 1, MAX_RETRIES, e,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+        return None
 
 
 @bot.event
 async def on_ready():
     logger.info("✅ Conectado como %s (%d banderas soportadas)", bot.user, len(FLAG_LANG))
+    invalid = sorted({l for l in FLAG_LANG.values() if l not in SUPPORTED_LANGS})
+    if invalid:
+        logger.warning("Códigos no soportados por deep-translator: %s", invalid)
 
 
 @bot.event
@@ -398,42 +436,53 @@ async def on_raw_reaction_add(payload):
         return
 
     cache_key = (payload.message_id, target_lang)
-    if cache_key in _translated_cache:
+    if cache_key in _translated_cache or cache_key in _in_progress:
         return
-
-    channel = bot.get_channel(payload.channel_id)
-    if channel is None:
-        return
+    _in_progress.add(cache_key)
 
     try:
-        message = await channel.fetch_message(payload.message_id)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        logger.warning("No se pudo obtener el mensaje %s: %s", payload.message_id, e)
-        return
+        channel = bot.get_channel(payload.channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(payload.channel_id)
+            except discord.HTTPException:
+                return
 
-    if message.author.bot or not message.content:
-        return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logger.warning("No se pudo obtener el mensaje %s: %s", payload.message_id, e)
+            return
 
-    try:
-        translated = GoogleTranslator(source="auto", target=target_lang).translate(message.content)
-    except Exception as e:
-        logger.error("Error traduciendo mensaje %s: %s", payload.message_id, e)
-        return
+        if message.author.bot or not message.content:
+            return
 
-    if not translated or translated.lower() == message.content.lower():
-        return
+        translated = await translate_safely(message.content, target_lang)
+        if not translated:
+            logger.error("No se pudo traducir el mensaje %s", payload.message_id)
+            return
 
-    if len(translated) > MAX_REPLY_LENGTH:
-        translated = translated[:MAX_REPLY_LENGTH - 1] + "…"
+        if translated.strip().lower() == message.content.strip().lower():
+            return
 
-    if len(_translated_cache) >= MAX_CACHE_SIZE:
-        _translated_cache.clear()
-    _translated_cache.add(cache_key)
+        if len(translated) > MAX_REPLY_LENGTH:
+            translated = translated[:MAX_REPLY_LENGTH - 1] + "…"
 
-    try:
-        await message.reply(f"{emoji} **{translated}**")
-    except discord.HTTPException as e:
-        logger.error("Error enviando la traducción de %s: %s", payload.message_id, e)
+        try:
+            await message.reply(
+                f"{emoji} **{translated}**",
+                allowed_mentions=discord.AllowedMentions.none(),
+                mention_author=False,
+            )
+            remember(cache_key)  # solo se marca como hecho si se envió
+        except discord.HTTPException as e:
+            logger.error("Error enviando la traducción de %s: %s", payload.message_id, e)
+
+    except Exception:
+        logger.exception("Error inesperado procesando el mensaje %s", payload.message_id)
+    finally:
+        _in_progress.discard(cache_key)
 
 
 bot.run(TOKEN, log_handler=None)
+
