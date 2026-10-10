@@ -2,12 +2,17 @@ import logging
 import os
 import asyncio
 import random
+import time
 from collections import OrderedDict
 
+import aiohttp
 import discord
 from discord.ext import commands
 from deep_translator import GoogleTranslator
-from deep_translator.exceptions import LanguageNotSupportedException
+from deep_translator.exceptions import (
+    LanguageNotSupportedException,
+    TooManyRequests,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,14 +24,23 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise SystemExit("❌ Falta la variable de entorno DISCORD_TOKEN")
 
+# Opcional: email para subir el límite diario de MyMemory (5k -> 50k caracteres)
+MYMEMORY_EMAIL = os.getenv("MYMEMORY_EMAIL")
+# Poné USE_GOOGLE=0 en Railway si Google te bloquea siempre y querés ir directo a MyMemory
+USE_GOOGLE = os.getenv("USE_GOOGLE", "1") != "0"
+
 MAX_REPLY_LENGTH = 1900
 MAX_CACHE_SIZE = 5000
 TRANSLATION_DELAY = 0.8
 MAX_RETRIES = 3
+GOOGLE_COOLDOWN = 600  # segundos sin tocar Google tras un bloqueo
+MYMEMORY_CHUNK_BYTES = 450  # MyMemory acepta ~500 bytes por petición
 
 _translation_lock = asyncio.Lock()
 _translated_cache = OrderedDict()   # (message_id, lang) -> True
 _in_progress = set()                # (message_id, lang) en curso
+_google_blocked_until = 0.0
+_mymemory_blocked_until = 0.0
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -392,7 +406,89 @@ def remember(key):
         _translated_cache.popitem(last=False)
 
 
-async def translate_safely(text, target_lang):
+# ---------------------------------------------------------------------------
+# Respaldo gratuito: MyMemory (API directa, no depende de las IPs de Google)
+# ---------------------------------------------------------------------------
+
+def _split_chunks(text, max_bytes=MYMEMORY_CHUNK_BYTES):
+    """Parte el texto en trozos de máx. `max_bytes` bytes UTF-8,
+    cortando por saltos de línea / espacios cuando se puede."""
+    chunks, current = [], ""
+    for word in text.split(" "):
+        candidate = f"{current} {word}" if current else word
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        # palabra suelta más larga que el límite: se corta por caracteres
+        while len(word.encode("utf-8")) > max_bytes:
+            cut = len(word)
+            while len(word[:cut].encode("utf-8")) > max_bytes:
+                cut -= 1
+            chunks.append(word[:cut])
+            word = word[cut:]
+        current = word
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _mymemory_request(session, text, target_lang):
+    target = "he" if target_lang == "iw" else target_lang  # MyMemory usa "he"
+    params = {"q": text, "langpair": f"Autodetect|{target}"}
+    if MYMEMORY_EMAIL:
+        params["de"] = MYMEMORY_EMAIL
+
+    async with session.get(
+        "https://api.mymemory.translated.net/get",
+        params=params,
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        data = await resp.json(content_type=None)
+
+    status = int(data.get("responseStatus", 0))
+    translated = (data.get("responseData") or {}).get("translatedText", "")
+
+    if status == 429 or "MYMEMORY WARNING" in translated.upper():
+        raise TooManyRequests()
+    if status != 200 or not translated:
+        raise RuntimeError(f"MyMemory {status}: {data.get('responseDetails')}")
+    return translated
+
+
+async def translate_mymemory(text, target_lang):
+    global _mymemory_blocked_until
+
+    if time.time() < _mymemory_blocked_until:
+        logger.warning("MyMemory en pausa (cuota diaria agotada)")
+        return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            parts = []
+            for chunk in _split_chunks(text):
+                parts.append(await _mymemory_request(session, chunk, target_lang))
+                await asyncio.sleep(0.3)
+        return " ".join(parts)
+
+    except TooManyRequests:
+        _mymemory_blocked_until = time.time() + 3600
+        logger.error("MyMemory: cuota diaria agotada; pausa de 1 hora")
+        return None
+    except Exception as e:
+        logger.error("Error con MyMemory: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Traducción: Google primero, MyMemory si Google bloquea la IP
+# ---------------------------------------------------------------------------
+
+async def translate_google(text, target_lang):
+    """Devuelve (resultado, bloqueado). `bloqueado=True` => usar el respaldo."""
+    global _google_blocked_until
+
     async with _translation_lock:
         for attempt in range(MAX_RETRIES):
             try:
@@ -401,11 +497,19 @@ async def translate_safely(text, target_lang):
                     text,
                 )
                 await asyncio.sleep(TRANSLATION_DELAY)
-                return result
+                return result, False
 
             except LanguageNotSupportedException:
-                logger.error("Idioma no soportado: %s", target_lang)
-                return None  # no tiene sentido reintentar
+                logger.error("Idioma no soportado por Google: %s", target_lang)
+                return None, True  # probamos con MyMemory
+
+            except TooManyRequests:
+                _google_blocked_until = time.time() + GOOGLE_COOLDOWN
+                logger.warning(
+                    "Google bloqueó la IP; usando MyMemory por %d min",
+                    GOOGLE_COOLDOWN // 60,
+                )
+                return None, True
 
             except Exception as e:
                 logger.warning(
@@ -414,7 +518,17 @@ async def translate_safely(text, target_lang):
                 )
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
-        return None
+
+    return None, True  # agotó reintentos: también probamos el respaldo
+
+
+async def translate_safely(text, target_lang):
+    if USE_GOOGLE and time.time() >= _google_blocked_until:
+        result, fallback = await translate_google(text, target_lang)
+        if not fallback:
+            return result
+
+    return await translate_mymemory(text, target_lang)
 
 
 @bot.event
@@ -485,4 +599,3 @@ async def on_raw_reaction_add(payload):
 
 
 bot.run(TOKEN, log_handler=None)
-
